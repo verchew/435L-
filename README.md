@@ -1,4 +1,4 @@
-# SDC435L - GitHub Archive Redis Application
+# SDC435L - Redis Application
 
 A Python application that ingests GitHub Archive JSON data, stores records in a Redis database, and provides an interactive command-line interface (CLI) to perform full CRUD operations and analytical reporting.
 
