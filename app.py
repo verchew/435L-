@@ -1,234 +1,217 @@
+# =============================================================
+# author: mary laro
+# date: october 1, 2026
+# assignment: week 4 - neo4j graph database integration
+# course: sdc435l
+# =============================================================
+
 import json
-from cassandra.cluster import Cluster
-from collections import Counter
+from neo4j import GraphDatabase
 
-# Connect to local Cassandra cluster
-cluster = Cluster(['127.0.0.1'])
-session = cluster.connect()
+# neo4j desktop local connection credentials
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+password = "password1"
 
-# Set up keyspace
-session.execute("""
-    CREATE KEYSPACE IF NOT EXISTS github_keyspace 
-    WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
-""")
-session.set_keyspace('github_keyspace')
-
-# Table schema setup
-session.execute("""
-    CREATE TABLE IF NOT EXISTS repositories (
-        repo_name text PRIMARY KEY,
-        watch_count int
-    );
-""")
-
-session.execute("""
-    CREATE TABLE IF NOT EXISTS commits (
-        commit_id text PRIMARY KEY,
-        repo_name text,
-        message text
-    );
-""")
+driver = GraphDatabase.driver(uri, auth=(user, password))
 
 # -------------------------------------------------------------
-# 1. Data Ingestion
+# 1. data ingestion
 # -------------------------------------------------------------
-def load_data(limit=1000):
-    """Loads repository and commit data from JSON files."""
-    repo_count = 0
-    commit_count = 0
-
-    # Ingest repositories
-    try:
-        with open("Sample_Repos.json", "r", encoding="utf-8") as f:
-            for line in f:
-                if repo_count >= limit:
-                    break
-                line = line.strip()
-                if line:
-                    item = json.loads(line)
-                    name = item.get("repo_name", "")
-                    try:
-                        watch_count = int(item.get("watch_count", 0))
-                    except ValueError:
-                        watch_count = 0
-
-                    if name:
-                        session.execute(
-                            "INSERT INTO repositories (repo_name, watch_count) VALUES (%s, %s);",
-                            (name, watch_count)
-                        )
-                        repo_count += 1
-        print(f"\n[Success] Loaded {repo_count} repositories into Cassandra.")
-    except FileNotFoundError:
-        print("\n[Error] Sample_Repos.json not found in current directory.")
-
-    # Ingest commits
+def load_data(limit=500):
+    """loads commit records from json and creates user and repo nodes."""
+    count = 0
+    query = """
+    MERGE (u:User {name: $author})
+    MERGE (r:Repository {name: $repo})
+    MERGE (u)-[c:COMMITTED_TO]->(r)
+    ON CREATE SET c.count = 1
+    ON MATCH SET c.count = c.count + 1
+    """
     try:
         with open("Sample_Commits.json", "r", encoding="utf-8") as f:
-            for line in f:
-                if commit_count >= limit:
-                    break
-                line = line.strip()
-                if line:
-                    item = json.loads(line)
-                    c_id = item.get("commit", "")
-                    repo = item.get("repo_name", "")
-                    msg = item.get("message", "")
-                    if c_id:
-                        session.execute(
-                            "INSERT INTO commits (commit_id, repo_name, message) VALUES (%s, %s, %s);",
-                            (c_id, repo, msg)
-                        )
-                        commit_count += 1
-        print(f"[Success] Loaded {commit_count} commits into Cassandra.")
+            with driver.session() as session:
+                for line in f:
+                    if count >= limit:
+                        break
+                    line = line.strip()
+                    if line:
+                        item = json.loads(line)
+                        repo = item.get("repo_name", "")
+                        author_data = item.get("author", {})
+                        author = author_data.get("name", "") if isinstance(author_data, dict) else str(author_data)
+
+                        if repo and author:
+                            session.run(query, author=author, repo=repo)
+                            count += 1
+
+        print(f"\n[success] ingested {count} commit relationships into neo4j.")
     except FileNotFoundError:
-        print("[Notice] Sample_Commits.json not found in current directory.")
+        print("\n[error] Sample_Commits.json not found in the current folder.")
+    except Exception as e:
+        print(f"\n[error] database connection failed: {e}")
 
 # -------------------------------------------------------------
-# 2. CRUD Operations
+# 2. crud operations
 # -------------------------------------------------------------
 def create_repo():
-    """Create: Insert a new repository record."""
-    name = input("Enter repository name (e.g., owner/repo): ").strip()
+    """create: insert a new repository node into the graph."""
+    name = input("enter repository name (e.g., owner/repo): ").strip()
     if not name:
-        print("[Error] Name cannot be empty.")
+        print("[error] repository name cannot be empty.")
         return
-    watch_input = input("Enter initial watch count: ").strip()
-    watch_count = int(watch_input) if watch_input.isdigit() else 0
 
-    session.execute(
-        "INSERT INTO repositories (repo_name, watch_count) VALUES (%s, %s);",
-        (name, watch_count)
-    )
-    print(f"[Success] Inserted repository '{name}'.")
+    query = """
+    MERGE (r:Repository {name: $name})
+    ON CREATE SET r.created_at = timestamp()
+    RETURN r.name AS repo_name
+    """
+    with driver.session() as session:
+        result = session.run(query, name=name).single()
+        print(f"[success] repository node '{result['repo_name']}' created or verified.")
 
 def read_repo():
-    """Read: Query a repository by name."""
-    name = input("Enter repository name to view: ").strip()
-    row = session.execute(
-        "SELECT repo_name, watch_count FROM repositories WHERE repo_name = %s;",
-        (name,)
-    ).one()
-    if row:
-        print("\n--- Repository Details ---")
-        print(f"Name:        {row.repo_name}")
-        print(f"Watch Count: {row.watch_count}")
-    else:
-        print(f"[Notice] Repository '{name}' not found.")
+    """read: find a repository node and display its contributors."""
+    name = input("enter repository name to view: ").strip()
+    query = """
+    MATCH (r:Repository {name: $name})
+    OPTIONAL MATCH (u:User)-[c:COMMITTED_TO]->(r)
+    RETURN r.name AS repo_name, collect(u.name) AS contributors
+    """
+    with driver.session() as session:
+        result = session.run(query, name=name).single()
+        if result and result["repo_name"]:
+            print("\n--- repository details ---")
+            print(f"name:         {result['repo_name']}")
+            contributors = result["contributors"]
+            print(f"contributors: {', '.join(contributors) if contributors else 'none recorded'}")
+        else:
+            print(f"[notice] repository '{name}' was not found.")
 
 def update_repo():
-    """Update: Change the watch count for an existing repository."""
-    name = input("Enter repository name to update: ").strip()
-    row = session.execute(
-        "SELECT repo_name FROM repositories WHERE repo_name = %s;",
-        (name,)
-    ).one()
-    if not row:
-        print(f"[Notice] Repository '{name}' not found.")
+    """update: rename an existing repository node."""
+    old_name = input("enter current repository name: ").strip()
+    new_name = input("enter new repository name: ").strip()
+    if not old_name or not new_name:
+        print("[error] names cannot be empty.")
         return
 
-    watch_input = input("Enter updated watch count: ").strip()
-    if not watch_input.isdigit():
-        print("[Error] Watch count must be an integer.")
-        return
-
-    session.execute(
-        "UPDATE repositories SET watch_count = %s WHERE repo_name = %s;",
-        (int(watch_input), name)
-    )
-    print(f"[Success] Updated '{name}'.")
+    query = """
+    MATCH (r:Repository {name: $old_name})
+    SET r.name = $new_name
+    RETURN r.name AS updated_name
+    """
+    with driver.session() as session:
+        result = session.run(query, old_name=old_name, new_name=new_name).single()
+        if result:
+            print(f"[success] updated repository name to '{result['updated_name']}'.")
+        else:
+            print(f"[notice] repository '{old_name}' was not found.")
 
 def delete_repo():
-    """Delete: Remove a repository record."""
-    name = input("Enter repository name to delete: ").strip()
-    session.execute(
-        "DELETE FROM repositories WHERE repo_name = %s;",
-        (name,)
-    )
-    print(f"[Success] Deleted repository '{name}' (if it existed).")
+    """delete: detach and delete a repository node and relationships."""
+    name = input("enter repository name to delete: ").strip()
+    query = """
+    MATCH (r:Repository {name: $name})
+    DETACH DELETE r
+    RETURN count(r) AS deleted_count
+    """
+    with driver.session() as session:
+        result = session.run(query, name=name).single()
+        if result and result["deleted_count"] > 0:
+            print(f"[success] repository '{name}' and attached relationships deleted.")
+        else:
+            print(f"[notice] repository '{name}' was not found.")
 
 # -------------------------------------------------------------
-# 3. Analytical Features
+# 3. analytical features
 # -------------------------------------------------------------
-def feature_trending_topics():
-    """Feature 1: Identify trending topics/repositories by commit volume."""
-    rows = session.execute("SELECT repo_name FROM commits;")
-    counts = Counter(r.repo_name for r in rows if r.repo_name)
+def feature_collaboration_patterns():
+    """feature 1: discover collaboration patterns between users sharing repositories."""
+    query = """
+    MATCH (u1:User)-[:COMMITTED_TO]->(r:Repository)<-[:COMMITTED_TO]-(u2:User)
+    WHERE u1.name < u2.name
+    RETURN u1.name AS user1, u2.name AS user2, count(r) AS shared_repos
+    ORDER BY shared_repos DESC
+    LIMIT 5
+    """
+    with driver.session() as session:
+        results = list(session.run(query))
+        print("\n--- collaboration patterns (users sharing repositories) ---")
+        if not results:
+            print("no shared repository collaborations found in current sample.")
+            return
+        for row in results:
+            print(f"{row['user1']} & {row['user2']} -> {row['shared_repos']} shared repo(s)")
 
-    if not counts:
-        print("[Notice] No commit data available.")
-        return
+def feature_repo_similarities():
+    """feature 2: find repository similarities based on common contributors."""
+    query = """
+    MATCH (r1:Repository)<-[:COMMITTED_TO]-(u:User)-[:COMMITTED_TO]->(r2:Repository)
+    WHERE r1.name < r2.name
+    RETURN r1.name AS repo1, r2.name AS repo2, count(u) AS common_contributors
+    ORDER BY common_contributors DESC
+    LIMIT 5
+    """
+    with driver.session() as session:
+        results = list(session.run(query))
+        print("\n--- repository similarities (common contributors) ---")
+        if not results:
+            print("no common contributors found across distinct repositories.")
+            return
+        for row in results:
+            print(f"{row['repo1']} <-> {row['repo2']} -> {row['common_contributors']} common contributor(s)")
 
-    print("\n--- Trending Topics: Most Active Repositories (Commit Count) ---")
-    for rank, (repo, count) in enumerate(counts.most_common(5), start=1):
-        print(f"{rank}. {repo} - {count} commits")
+def feature_network_centrality():
+    """feature 3: identify most active contributors and repositories by degree centrality."""
+    user_query = """
+    MATCH (u:User)-[c:COMMITTED_TO]->(:Repository)
+    RETURN u.name AS user, count(c) AS repo_count
+    ORDER BY repo_count DESC
+    LIMIT 5
+    """
+    repo_query = """
+    MATCH (:User)-[c:COMMITTED_TO]->(r:Repository)
+    RETURN r.name AS repo, count(c) AS contributor_count
+    ORDER BY contributor_count DESC
+    LIMIT 5
+    """
+    with driver.session() as session:
+        top_users = list(session.run(user_query))
+        top_repos = list(session.run(repo_query))
 
-def feature_commit_message_words():
-    """Feature 2: Popular words used in commit messages."""
-    rows = session.execute("SELECT message FROM commits;")
-    words = []
-    stop_words = {"the", "a", "to", "and", "in", "of", "for", "on", "with", "is", "this", ""}
+        print("\n--- network centrality summary ---")
+        print("top contributors (by repositories touched):")
+        for u in top_users:
+            print(f"  - {u['user']}: {u['repo_count']} repo(s)")
 
-    for r in rows:
-        if r.message:
-            for token in r.message.lower().split():
-                cleaned = "".join(c for c in token if c.isalnum())
-                if cleaned and cleaned not in stop_words and len(cleaned) > 2:
-                    words.append(cleaned)
-
-    counts = Counter(words)
-    if not counts:
-        print("[Notice] No commit message tokens available.")
-        return
-
-    print("\n--- Most Frequent Words in Commit Messages ---")
-    for rank, (word, count) in enumerate(counts.most_common(10), start=1):
-        print(f"{rank}. '{word}' - {count} occurrences")
-
-def feature_summary_metrics():
-    """Feature 3: Dataset high-level summary metrics."""
-    rows = session.execute("SELECT watch_count FROM repositories;")
-    watches = [r.watch_count for r in rows if r.watch_count is not None]
-
-    if not watches:
-        print("[Notice] No repositories loaded.")
-        return
-
-    total_repos = len(watches)
-    total_watches = sum(watches)
-    avg_watches = total_watches / total_repos
-    max_watches = max(watches)
-
-    print("\n--- Repository Summary Metrics ---")
-    print(f"Total Repositories: {total_repos}")
-    print(f"Total Watches:      {total_watches}")
-    print(f"Average Watches:    {avg_watches:.2f}")
-    print(f"Maximum Watches:    {max_watches}")
+        print("\ntop repositories (by contributor count):")
+        for r in top_repos:
+            print(f"  - {r['repo']}: {r['contributor_count']} contributor(s)")
 
 # -------------------------------------------------------------
-# 4. Main Menu Loop
+# 4. main menu loop
 # -------------------------------------------------------------
 def main_menu():
     while True:
         print("\n==============================")
-        print(" GitHub Archive - Cassandra CLI")
-        print(" Marlar6882 Wk3 Project")
+        print("   GitHub Archive - Neo4j CLI")
         print("==============================")
         print("1. Load Data from JSON")
         print("2. Create Repository Record")
         print("3. Read Repository Record")
         print("4. Update Repository Record")
         print("5. Delete Repository Record")
-        print("6. [Feature 1] Trending Topics by Commits")
-        print("7. [Feature 2] Popular Commit Words")
-        print("8. [Feature 3] Summary Metrics")
+        print("6. [Feature 1] Collaboration Patterns")
+        print("7. [Feature 2] Repository Similarities")
+        print("8. [Feature 3] Network Centrality Summary")
         print("0. Exit")
         print("==============================")
 
-        choice = input("Select an option (0-8): ").strip()
+        choice = input("select an option (0-8): ").strip()
 
         if choice == "1":
-            load_data(limit=1000)
+            load_data(limit=500)
         elif choice == "2":
             create_repo()
         elif choice == "3":
@@ -238,17 +221,17 @@ def main_menu():
         elif choice == "5":
             delete_repo()
         elif choice == "6":
-            feature_trending_topics()
+            feature_collaboration_patterns()
         elif choice == "7":
-            feature_commit_message_words()
+            feature_repo_similarities()
         elif choice == "8":
-            feature_summary_metrics()
+            feature_network_centrality()
         elif choice == "0":
-            cluster.shutdown()
-            print("\nExiting program. Goodbye!")
+            driver.close()
+            print("\nexiting program. goodbye!")
             break
         else:
-            print("\n[Error] Invalid selection. Enter 0 through 8.")
+            print("\n[error] invalid selection. enter 0 through 8.")
 
 if __name__ == "__main__":
     main_menu()
